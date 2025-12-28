@@ -1,0 +1,50 @@
+name: Update Football Blackjack Scoreboard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "12 * * * *" # hourly at minute 12 (UTC)
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Generate scoreboard.json
+        env:
+          CUTOFF_ISO: 2025-12-25T00:00:00Z
+          OUTPUT_JSON_PATH: scoreboard.json
+          # Optional: slow down if you ever see rate-limit issues
+          SLEEP_BETWEEN_REQUESTS_SEC: "0.35"
+        run: |
+          python generate_scoreboard.py
+          ls -la scoreboard.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload scoreboard.json to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          aws s3 cp scoreboard.json "s3://$S3_BUCKET/scoreboard.json" \
+            --content-type "application/json" \
+            --cache-control "no-store, max-age=0"
