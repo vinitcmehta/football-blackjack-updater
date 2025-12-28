@@ -14,13 +14,9 @@ FPL_BASE = "https://fantasy.premierleague.com/api"
 BOOTSTRAP_URL = f"{FPL_BASE}/bootstrap-static/"
 ELEMENT_SUMMARY_URL = f"{FPL_BASE}/element-summary/{{element_id}}/"
 
-# Site output (local file; workflow uploads to S3)
 OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "scoreboard.json")
-
-# Cutoff for your game
 CUTOFF_ISO = os.environ.get("CUTOFF_ISO", "2025-12-25T00:00:00Z")
 
-# Picks
 PICKS: Dict[str, List[str]] = {
     "Tommy": ["Grealish", "Neto", "Trossard", "Saka"],
     "Tiz":   ["Gordon", "Rice", "MGW", "Rogers"],
@@ -28,33 +24,33 @@ PICKS: Dict[str, List[str]] = {
     "Vinit": ["Bowen", "Gyokeres", "Bruno G", "Pedro"],
 }
 
-# Aliases / shorthand → normalized full name hints
+# Aliases: shorthand -> something that exists in FPL (after normalization)
 ALIASES: Dict[str, str] = {
     "mgw": "morgan gibbs-white",
     "dcl": "dominic calvert-lewin",
     "bruno g": "bruno guimaraes",
     "guehi": "marc guehi",
-    # Helpful optional pinning if you see ambiguity:
-    # "neto": "pedro neto",
-    # "pedro": "joao pedro",
+
+    # Fixes for your screenshot:
+    # - Neto is ambiguous: choose the one you mean (most likely Pedro Neto)
+    "neto": "pedro neto",
+    # - Pedro alone won't match João Pedro
+    "pedro": "joao pedro",
 }
 
-# Optional: hard-pin specific picks to an FPL element id (overrides name matching)
-# You can fill these in later if any "ambiguous" shows up.
+# If you ever want to hard-pin a pick to a specific FPL element id, do it here.
+# This overrides all matching logic.
 PLAYER_ID_OVERRIDES: Dict[str, int] = {
     # Example:
+    # "Neto": 999,
     # "Pedro": 123,
+    # "Bruno G": 456,
 }
 
-# Polite throttling (avoid getting rate-limited / blocked)
 SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.35"))
 
-# -----------------------------
-# HTTP helpers
-# -----------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
-    # Browser-like headers (helps reliability)
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -72,7 +68,6 @@ def fetch_json(url: str, max_retries: int = 6) -> Any:
     for attempt in range(1, max_retries + 1):
         try:
             r = SESSION.get(url, timeout=25)
-            # If rate limited / temporarily blocked, back off and retry
             if r.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"HTTP {r.status_code}")
             r.raise_for_status()
@@ -85,9 +80,6 @@ def fetch_json(url: str, max_retries: int = 6) -> Any:
             time.sleep(sleep_s)
 
 
-# -----------------------------
-# Normalization / parsing
-# -----------------------------
 def norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
@@ -100,24 +92,23 @@ def norm(s: str) -> str:
 
 
 def parse_iso_z(s: str) -> datetime:
-    # "2025-12-25T00:00:00Z" -> aware UTC datetime
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s).astimezone(timezone.utc)
 
 
-# -----------------------------
-# FPL mapping + goal counting
-# -----------------------------
-def build_player_index(elements: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def tokenize(s: str) -> List[str]:
+    return [t for t in norm(s).split() if t]
+
+
+def build_player_data(elements: List[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """
-    Index players by several keys:
-    - full name (first + second)
-    - web_name
-    - second_name
-    Each normalized key maps to a list of candidate elements.
+    Returns:
+      - idx: normalized key -> list of candidate players
+      - roster: list of players with normalized searchable fields for fuzzy matching
     """
     idx: Dict[str, List[Dict[str, Any]]] = {}
+    roster: List[Dict[str, Any]] = []
 
     for e in elements:
         element_id = e.get("id")
@@ -126,6 +117,19 @@ def build_player_index(elements: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
         web = e.get("web_name") or ""
 
         full = f"{first} {second}".strip()
+        display = full or web or second
+
+        n_full = norm(full)
+        n_web = norm(web)
+        n_second = norm(second)
+
+        roster.append({
+            "id": element_id,
+            "display": display,
+            "n_full": n_full,
+            "n_web": n_web,
+            "n_second": n_second,
+        })
 
         keys = {full, web, second}
         for k in keys:
@@ -134,16 +138,13 @@ def build_player_index(elements: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
                 continue
             idx.setdefault(nk, []).append({
                 "id": element_id,
-                "display": full or web or second,
-                "first_name": first,
-                "second_name": second,
-                "web_name": web,
+                "display": display,
             })
 
-    return idx
+    return idx, roster
 
 
-def resolve_pick_to_element(pick: str, idx: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def resolve_pick_to_element(pick: str, idx: Dict[str, List[Dict[str, Any]]], roster: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Hard override if set
     if pick in PLAYER_ID_OVERRIDES:
         return {"status": "ok", "id": PLAYER_ID_OVERRIDES[pick], "display_name": pick}
@@ -151,17 +152,44 @@ def resolve_pick_to_element(pick: str, idx: Dict[str, List[Dict[str, Any]]]) -> 
     key = norm(pick)
     key = ALIASES.get(key, key)
 
+    # 1) Exact lookup
     candidates = idx.get(key, [])
     if len(candidates) == 1:
         c = candidates[0]
         return {"status": "ok", "id": c["id"], "display_name": c["display"]}
 
-    if len(candidates) == 0:
+    if len(candidates) > 1:
+        return {
+            "status": "ambiguous",
+            "id": None,
+            "display_name": pick,
+            "suggestions": [c["display"] for c in candidates[:8]],
+        }
+
+    # 2) Fuzzy token match: all tokens must appear in n_full or n_web
+    toks = tokenize(key)
+    if not toks:
         return {"status": "not_found", "id": None, "display_name": pick}
 
-    # ambiguous
-    suggestions = [c["display"] for c in candidates[:6]]
-    return {"status": "ambiguous", "id": None, "display_name": pick, "suggestions": suggestions}
+    fuzzy = []
+    for r in roster:
+        haystacks = (r["n_full"], r["n_web"])
+        if any(all(t in h.split() for t in toks) for h in haystacks if h):
+            fuzzy.append(r)
+
+    # If fuzzy found exactly one, accept it
+    if len(fuzzy) == 1:
+        return {"status": "ok", "id": fuzzy[0]["id"], "display_name": fuzzy[0]["display"]}
+
+    if len(fuzzy) > 1:
+        # Try narrowing: prefer full-name matches
+        full_hits = [r for r in fuzzy if all(t in (r["n_full"].split() if r["n_full"] else []) for t in toks)]
+        if len(full_hits) == 1:
+            return {"status": "ok", "id": full_hits[0]["id"], "display_name": full_hits[0]["display"]}
+        sugg = [r["display"] for r in (full_hits[:8] if full_hits else fuzzy[:8])]
+        return {"status": "ambiguous", "id": None, "display_name": pick, "suggestions": sugg}
+
+    return {"status": "not_found", "id": None, "display_name": pick}
 
 
 def goals_since_cutoff(element_id: int, cutoff: datetime) -> int:
@@ -185,7 +213,7 @@ def compute_scoreboard() -> Dict[str, Any]:
 
     bootstrap = fetch_json(BOOTSTRAP_URL)
     elements = bootstrap.get("elements", [])
-    idx = build_player_index(elements)
+    idx, roster = build_player_data(elements)
 
     participants = []
     for person, picks in PICKS.items():
@@ -194,7 +222,7 @@ def compute_scoreboard() -> Dict[str, Any]:
         all_scored = True
 
         for pick in picks:
-            resolved = resolve_pick_to_element(pick, idx)
+            resolved = resolve_pick_to_element(pick, idx, roster)
 
             if resolved["status"] != "ok":
                 rows.append({
@@ -218,7 +246,6 @@ def compute_scoreboard() -> Dict[str, Any]:
             })
 
         is_bust = (total > 21) or (not all_scored)
-
         participants.append({
             "name": person,
             "players": rows,
@@ -231,19 +258,16 @@ def compute_scoreboard() -> Dict[str, Any]:
     eligible.sort(key=lambda x: x["total"], reverse=True)
     leaderboard = [{"name": p["name"], "total": p["total"]} for p in eligible]
 
-    payload = {
+    return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "cutoff_iso": CUTOFF_ISO,
         "participants": participants,
         "leaderboard": leaderboard,
         "notes": [
             "Data source: Fantasy Premier League public endpoints.",
-            "If a player shows 'ambiguous', pin it via ALIASES or PLAYER_ID_OVERRIDES in generate_scoreboard.py.",
-            "If a player is not in the Premier League/FPL dataset, it will show 'not_found'.",
+            "If you see 'ambiguous', pin it via ALIASES or PLAYER_ID_OVERRIDES in generate_scoreboard.py.",
         ],
     }
-
-    return payload
 
 
 def main() -> None:
