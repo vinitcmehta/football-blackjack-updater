@@ -18,7 +18,7 @@ OUTPUT_JSON_PATH = os.environ.get("OUTPUT_JSON_PATH", "scoreboard.json")
 CUTOFF_ISO = os.environ.get("CUTOFF_ISO", "2025-12-25T00:00:00Z")
 
 PICKS: Dict[str, List[str]] = {
-    "Tommy": ["Grealish", "Neto", "Trossard", "Saka"],
+    "Tommy": ["Buendia", "Neto", "Trossard", "Saka"],
     "Tiz":   ["Gordon", "Rice", "MGW", "Rogers"],
     "Matt":  ["Guehi", "Rice", "Gordon", "DCL"],
     "Vinit": ["Bowen", "Gyokeres", "Bruno G", "Pedro"],
@@ -45,6 +45,12 @@ PLAYER_ID_OVERRIDES: Dict[str, int] = {
     # "Neto": 999,
     # "Pedro": 123,
     # "Bruno G": 456,
+}
+
+# Manual goal adjustments applied AFTER counting goals since cutoff.
+# Format: { "<PickName>": <delta_goals> }
+GOAL_ADJUSTMENTS: Dict[str, int] = {
+    "Buendia": -1,
 }
 
 SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.35"))
@@ -235,6 +241,12 @@ def compute_scoreboard() -> Dict[str, Any]:
                 continue
 
             g = goals_since_cutoff(int(resolved["id"]), cutoff)
+
+            # Apply manual adjustment (e.g. Buendia -1 because he inherits Grealish slot)
+            g += GOAL_ADJUSTMENTS.get(pick, 0)
+            if g < 0:
+                g = 0
+
             total += g
             if g <= 0:
                 all_scored = False
